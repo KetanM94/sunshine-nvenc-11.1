@@ -1,0 +1,93 @@
+name: Build and Publish Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        id: deps-cache
+        with:
+          path: |
+            /etc/pacman.conf
+            /var/lib/pacman/sync/
+            /var/cache/pacman/pkg/
+          key: ${{ runner.os }}-dependencies-${{ hashFiles('/etc/pacman.conf') }}
+          restore-keys: |
+            ${{ runner.os }}-dependencies-
+      
+      - name: Install dependencies
+        run: |
+          if [ -z "$GITHUB_ACTIONS" ]; then
+            echo "Not running in GitHub Actions, skipping cache"
+          elif [ ${{ steps.deps-cache.outputs.cache-hit }} ]; then
+            echo "Dependencies already cached, skipping download and starting installation"
+            pacman -U /var/cache/pacman/pkg/*.pkg.tar.zst --noconfirm
+          else
+            pacman -Syyu base-devel git cmake ccache sudo --noconfirm
+            pacman -U --noconfirm https://archive.archlinux.org/packages/g/gcc10-libs/gcc10-libs-1:10.2.0-3-x86_64.pkg.tar.zst
+            pacman -U --noconfirm https://archive.archlinux.org/packages/g/gcc10/gcc10-1:10.2.0-3-x86_64.pkg.tar.zst
+            pacman -U --noconfirm https://archive.archlinux.org/packages/c/cuda/cuda-11.1.1-1-x86_64.pkg.tar.zst
+          fi
+      
+      - name: Add non-root user builder
+        run: |
+          groupadd sudo
+          useradd -m builder
+          usermod -aG sudo builder
+          echo "## Allow builder to execute any root command
+          %builder ALL=(ALL) NOPASSWD: /usr/bin/pacman" >> "/etc/sudoers"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache build
+        uses: actions/cache@v4
+        id: build-cache
+        with:
+          path: ${{ github.workspace }}/src
+          key: ${{ runner.os }}-build-${{ hashFiles('${{ github.workspace }}/src/build_dir/CMakeCache.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
+      
+      - name: Build package
+        run: |
+          chown -R builder:builder "${GITHUB_WORKSPACE}"
+          cd "${GITHUB_WORKSPACE}"
+          export CCACHE_SIZE="4G"
+          sudo -u builder bash <<EOF
+            export USE_CCACHE=1
+            export CCACHE_EXEC=/usr/bin/ccache
+            ccache -M "$CCACHE_SIZE"
+            if [ -d src ]; then
+              echo "Cache found, using it"
+            else
+              echo "No cache found, building from scratch"
+            fi
+            makepkg -s --noconfirm --needed
+          EOF
+
+      - name: Get Tag Name
+        id: tag_name
+        run: |
+          TAG="v$(basename ${GITHUB_WORKSPACE}/*.pkg* | cut -d'-' -f3 | cut -d'.' -f1-3)"
+          echo "TAG_NAME=$TAG" >> $GITHUB_OUTPUT
+      
+      - name: Get File Path
+        id: file_path
+        run: |
+          FILE="$(echo ${GITHUB_WORKSPACE}/*.pkg*)"
+          echo "FILE_PATH=$FILE" >> $GITHUB_OUTPUT
+      
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2.0.8
+        continue-on-error: true
+        with:
+          name: ${{ steps.tag_name.outputs.TAG_NAME }}
+          prerelease: false
+          tag_name: ${{ steps.tag_name.outputs.TAG_NAME }}
+          files: ${{ steps.file_path.outputs.FILE_PATH }}
